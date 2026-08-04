@@ -2,8 +2,16 @@ import pytest
 
 from smartthings_local.errors import MalformedMessageError
 from smartthings_local.protocol.coap import (
-    build_coap, parse_coap, encode_options, block_value, fmt_code,
-    TYPE_CON, METHOD_GET, URI_PATH, ACCEPT, CF_CBOR, BLOCK2,
+    ACCEPT,
+    CF_CBOR,
+    METHOD_GET,
+    TYPE_CON,
+    URI_PATH,
+    block_value,
+    build_coap,
+    encode_options,
+    fmt_code,
+    parse_coap,
 )
 
 
@@ -56,3 +64,29 @@ def test_reserved_option_nibbles_raise_classified_value_error(option_header):
         parse_coap(datagram)
 
     assert isinstance(exc.value, ValueError)
+
+
+@pytest.mark.parametrize(
+    'datagram',
+    (
+        b'',
+        b'\x40\x01\x00',
+        b'\x80\x01\x00\x01',       # unsupported CoAP version
+        b'\x49\x01\x00\x01' + b'x' * 9,  # reserved token length
+        b'\x44\x01\x00\x01abc',    # truncated token
+        b'\x40\x01\x00\x01\xd0', # truncated extended delta
+        b'\x40\x01\x00\x01\xe0\x00',
+        b'\x40\x01\x00\x01\x0d', # truncated extended length
+        b'\x40\x01\x00\x01\x0e\x00',
+        b'\x40\x01\x00\x01\x03ab',  # truncated option value
+        b'\x40\x01\x00\x01\xff', # empty payload marker
+    ),
+)
+def test_truncated_or_structurally_invalid_datagrams_are_classified(datagram):
+    with pytest.raises(MalformedMessageError):
+        parse_coap(datagram)
+
+
+def test_non_bytes_coap_input_is_classified():
+    with pytest.raises(MalformedMessageError):
+        parse_coap('not wire bytes')
