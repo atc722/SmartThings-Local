@@ -61,9 +61,22 @@ def encode_options(opts):
 
 def parse_coap(data):
     """Decode a CoAP datagram. Returns (mtype, code, mid, token,
-    options, payload). options is a list of (num, value_bytes)."""
+    options, payload). options is a list of (num, value_bytes).
+
+    The decoder is intentionally strict because some callers use it on
+    unauthenticated UDP datagrams. Truncated headers, tokens, extended option
+    fields, option values, and empty payload markers are classified rather
+    than leaking ``IndexError`` or being accepted as partial messages.
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise MalformedMessageError()
+    data = bytes(data)
+    if len(data) < 4 or data[0] >> 6 != 1:
+        raise MalformedMessageError()
     mt = (data[0] >> 4) & 0x03
     tkl = data[0] & 0x0F
+    if tkl > 8 or len(data) < 4 + tkl:
+        raise MalformedMessageError()
     code = data[1]
     mid = int.from_bytes(data[2:4], 'big')
     tok = data[4:4 + tkl]
@@ -74,27 +87,39 @@ def parse_coap(data):
     while i < len(data):
         b = data[i]
         if b == 0xFF:
+            if i + 1 >= len(data):
+                raise MalformedMessageError()
             payload = data[i + 1:]
             break
         d_nib, l_nib = b >> 4, b & 0x0F
         i += 1
         if d_nib == 13:
+            if i >= len(data):
+                raise MalformedMessageError()
             delta = 13 + data[i]; i += 1
         elif d_nib == 14:
+            if i + 2 > len(data):
+                raise MalformedMessageError()
             delta = 269 + int.from_bytes(data[i:i + 2], 'big'); i += 2
         elif d_nib == 15:
             raise MalformedMessageError()
         else:
             delta = d_nib
         if l_nib == 13:
+            if i >= len(data):
+                raise MalformedMessageError()
             length = 13 + data[i]; i += 1
         elif l_nib == 14:
+            if i + 2 > len(data):
+                raise MalformedMessageError()
             length = 269 + int.from_bytes(data[i:i + 2], 'big'); i += 2
         elif l_nib == 15:
             raise MalformedMessageError()
         else:
             length = l_nib
         num = prev + delta
+        if i + length > len(data):
+            raise MalformedMessageError()
         opts.append((num, data[i:i + length]))
         i += length
         prev = num

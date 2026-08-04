@@ -8,6 +8,10 @@ from smartthings_local.ocf.observe_refresh import ObserveRefreshTask
 from smartthings_local.ocf.state_cache import StateCache
 from smartthings_local.protocol.auth import AuthenticationProvider, CertificateAuth
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
+from smartthings_local.protocol.ocf_discovery import (
+    OcfSecurePortDiscoveryResult,
+    discover_ocf_secure_ports,
+)
 
 
 def _assert_compatible_signature(callable_object, expected: list[str]) -> None:
@@ -118,3 +122,15 @@ def test_observe_refresh_task_keeps_current_consumer_surface():
         ObserveRefreshTask.run_forever,
         ["self", "stop"],
     )
+
+
+def test_ocf_secure_port_discovery_has_a_small_composable_surface():
+    _assert_compatible_signature(discover_ocf_secure_ports, ["host"])
+    result = OcfSecurePortDiscoveryResult(
+        ports=(5684,),
+        attempts=1,
+        response_received=True,
+    )
+
+    assert result.found
+    assert result.ports == (5684,)
