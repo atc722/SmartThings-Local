@@ -192,7 +192,7 @@ from smartthings_local.protocol.ocf_discovery import discover_ocf_secure_ports
 
 fallback_ports = (5684, *range(49152, 49161))
 advertisement = discover_ocf_secure_ports(appliance_host)
-candidates = tuple(dict.fromkeys((*fallback_ports, *advertisement.ports)))
+candidates = advertisement.ports or fallback_ports
 probe = probe_dtls_ports(appliance_host, candidates)
 ```
 
@@ -200,8 +200,52 @@ probe = probe_dtls_ports(appliance_host, candidates)
 `GET /oic/res?rt=oic.r.doxm`. It accepts Samsung's dynamic plaintext response
 source port while still requiring the resolved target address and CoAP token,
 and assembles Block2 responses within fixed time, block-count, and payload
-limits. An advertised port remains only a candidate: require a successful
-stateless DTLS probe before attempting authentication.
+limits. Its default three-second timeout bounds all socket I/O in total (DNS
+resolution is synchronous and outside that budget); retries do not multiply
+that deadline. The example probes the fixed fallback range only when discovery
+does not return an advertised port, so this remains an explicit consumer
+policy rather than an automatic or widened scan. An advertised port remains
+only a candidate: require a successful stateless DTLS probe before attempting
+authentication.
+
+Some Samsung hosts expose multiple logical OCF devices from one IPv4 address,
+so the root `/oic/sec/doxm` identity is not always the appliance identity. When
+the SmartThings OCF `di` UUID is available, use the identity-aware multicast
+variant on one explicit LAN interface:
+
+```python
+from smartthings_local.protocol.ocf_discovery import (
+    discover_ocf_secure_ports_multicast,
+)
+
+advertisement = discover_ocf_secure_ports_multicast(
+    "11111111-2222-3333-4444-555555555555",
+    interface_address="192.0.2.10",
+)
+```
+
+This API performs exactly two IPv4 multicast NON discovery rounds, with a
+six-second collection window per round by default (about 12 seconds maximum)
+and accepts at most 64 datagrams per round. It succeeds only when the same sole
+source advertises the same ports in both rounds, reads links only from the exact
+normalized `di` container, binds legacy `p.sec` / `port` values to that
+response source, and accepts an `eps` URI only when its host equals the response
+source. The result exposes the matched address and ports to the caller but
+redacts the address, UUID, and port values from its `repr`. The existing unicast
+API remains appropriate when the target host is already identity-safe.
+
+The unicast and multicast entry points are explicit alternatives. Neither
+function invokes the other or starts an automatic fallback, so adding these
+APIs does not add discovery time to existing callers. A consumer chooses the
+known-host unicast path or the identity-aware multicast path for its own flow,
+then applies its separate DTLS and authentication gates.
+
+On a host that exposes multiple logical OCF devices, the two results may
+legitimately contain different ports. Do not merge them automatically:
+known-host unicast expresses trust in the caller-supplied host, while
+identity-aware multicast selects the one directory container with the requested
+`di`. That UUID match selects a candidate endpoint; it does not replace DTLS
+liveness and authenticated device-identity checks.
 
 ### Tested combinations
 

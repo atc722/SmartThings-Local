@@ -19,6 +19,7 @@ import secrets
 import selectors
 import socket
 import time
+import uuid
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -45,16 +46,22 @@ from .coap import (
 from .endpoint import ResolvedUdpEndpoint, resolve_udp_endpoints
 
 __all__ = [
+    'OcfMulticastSecurePortDiscoveryResult',
     'OcfSecurePortDiscoveryResult',
     'discover_ocf_secure_ports',
+    'discover_ocf_secure_ports_multicast',
 ]
 
 _DISCOVERY_PORT = 5683
+_IPV4_OCF_MULTICAST_GROUP = socket.inet_ntoa(bytes((224, 0, 1, 187)))
+_MULTICAST_ROUNDS = 2
+_MAX_MULTICAST_RESPONSES_PER_ROUND = 64
 _MAX_ENDPOINTS = 8
 _MAX_PORTS = 8
 _MAX_BLOCKS = 32
 _MAX_DATAGRAM_BYTES = 8192
 _MAX_PAYLOAD_BYTES = 65536
+_MAX_CONTAINERS = 64
 _MAX_LINKS = 256
 _MAX_ENDPOINT_URIS_PER_LINK = 32
 _OCF_CBOR_CONTENT_FORMAT = 10000
@@ -88,6 +95,35 @@ class OcfSecurePortDiscoveryResult:
             f'found={self.found!r}, port_count={len(self.ports)}, '
             f'attempts={self.attempts}, '
             f'response_received={self.response_received!r}, '
+            f'error_code={self.error_code!r})'
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class OcfMulticastSecurePortDiscoveryResult:
+    """Redacted result of identity-aware IPv4 multicast discovery.
+
+    ``address`` and ``ports`` are available for the caller's next bounded
+    probe, but the custom representation omits both. The target UUID is used
+    only during discovery and is not retained in the result.
+    """
+
+    address: str | None
+    ports: tuple[int, ...]
+    rounds: int
+    responses: int
+    error_code: str | None = None
+
+    @property
+    def found(self):
+        """Return whether one stable target advertisement was found."""
+        return self.address is not None and bool(self.ports)
+
+    def __repr__(self):
+        return (
+            'OcfMulticastSecurePortDiscoveryResult('
+            f'found={self.found!r}, port_count={len(self.ports)}, '
+            f'rounds={self.rounds}, responses={self.responses}, '
             f'error_code={self.error_code!r})'
         )
 
@@ -296,6 +332,27 @@ def _decode_cbor(payload):
     return value
 
 
+def _normalize_uuid(value):
+    """Return one canonical UUID value without rendering it."""
+    try:
+        if isinstance(value, uuid.UUID):
+            return value
+        if isinstance(value, bytes):
+            if len(value) == 16:
+                return uuid.UUID(bytes=value)
+            value = value.decode('ascii')
+        if not isinstance(value, str):
+            return None
+        folded = value.casefold()
+        for prefix in ('urn:uuid:', 'uuid:'):
+            if folded.startswith(prefix):
+                value = value[len(prefix):]
+                break
+        return uuid.UUID(value)
+    except (UnicodeDecodeError, ValueError, AttributeError):
+        return None
+
+
 def _resource_links(value):
     """Return a shallow, bounded OCF link sequence or ``None``."""
     containers = value if isinstance(value, list) else [value]
@@ -335,6 +392,95 @@ def _endpoint_uri_port(value):
             or parsed.path or parsed.query or parsed.fragment):
         return None
     return 5684 if port is None else port
+
+
+def _endpoint_uri_port_for_ipv4_source(value, source_key):
+    """Return a secure URI port only when its host is the response source."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        endpoint_key = socket.inet_pton(socket.AF_INET, parsed.hostname or '')
+    except (OSError, ValueError):
+        return None
+    if (parsed.scheme != 'coaps'
+            or endpoint_key != source_key
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path or parsed.query or parsed.fragment):
+        return None
+    return 5684 if port is None else port
+
+
+def _target_secure_ports_from_payload(payload, target_uuid, source_key):
+    """Classify one bounded directory payload for an exact target UUID.
+
+    The status is ``target`` (with zero or more ports), ``absent``, or
+    ``malformed``. Only links nested inside the matching top-level container
+    are considered. Legacy policy ports are implicitly bound to ``source_key``;
+    modern endpoint URIs must explicitly name that same IPv4 address.
+    """
+    value = _decode_cbor(payload)
+    if value is _UNSET:
+        return 'malformed', ()
+    containers = value if isinstance(value, list) else [value]
+    if (not containers or len(containers) > _MAX_CONTAINERS
+            or not all(isinstance(container, dict)
+                       for container in containers)):
+        return 'malformed', ()
+
+    matches = [
+        container for container in containers
+        if _normalize_uuid(container.get('di')) == target_uuid
+    ]
+    if not matches:
+        return 'absent', ()
+    if len(matches) != 1:
+        return 'malformed', ()
+
+    links = matches[0].get('links')
+    if (not isinstance(links, list) or len(links) > _MAX_LINKS
+            or not all(isinstance(link, dict) for link in links)):
+        return 'malformed', ()
+
+    ports = []
+    seen = set()
+
+    def add_port(port):
+        if (isinstance(port, bool) or not isinstance(port, int)
+                or not 1 <= port <= 65535 or port in seen):
+            return
+        seen.add(port)
+        ports.append(port)
+
+    for link in links:
+        if link.get('href') != '/oic/sec/doxm':
+            continue
+        resource_types = link.get('rt')
+        if isinstance(resource_types, str):
+            resource_types = [resource_types]
+        if (not isinstance(resource_types, list)
+                or 'oic.r.doxm' not in resource_types):
+            continue
+
+        policy = link.get('p')
+        if isinstance(policy, dict) and policy.get('sec') is True:
+            # A legacy policy has no host. Returning it with the datagram's
+            # source address is the binding; it is never associated with a
+            # different responder or a root-unicast identity.
+            add_port(policy.get('port'))
+
+        endpoints = link.get('eps')
+        if isinstance(endpoints, list):
+            for endpoint in endpoints[:_MAX_ENDPOINT_URIS_PER_LINK]:
+                if not isinstance(endpoint, dict):
+                    continue
+                add_port(_endpoint_uri_port_for_ipv4_source(
+                    endpoint.get('ep'), source_key))
+
+        if len(ports) >= _MAX_PORTS:
+            break
+    return 'target', tuple(sorted(ports[:_MAX_PORTS]))
 
 
 def _secure_ports_from_payload(payload):
@@ -393,6 +539,244 @@ def _build_request(token, mid, expected_number, szx):
     return build_coap(TYPE_NON, METHOD_GET, mid, token, options)
 
 
+def _validate_multicast_options(
+        target_uuid, interface_address, discovery_port, round_timeout):
+    if not isinstance(target_uuid, (str, bytes, uuid.UUID)):
+        raise TypeError('target_uuid must be a UUID string or bytes value')
+    normalized_uuid = _normalize_uuid(target_uuid)
+    if normalized_uuid is None:
+        raise ValueError('target_uuid must be a valid UUID')
+    if not isinstance(interface_address, str):
+        raise TypeError('interface_address must be an IPv4 string')
+    try:
+        interface_key = socket.inet_pton(socket.AF_INET, interface_address)
+    except OSError as exc:
+        raise ValueError(
+            'interface_address must be a valid IPv4 address') from exc
+    if (interface_key == b'\x00\x00\x00\x00'
+            or interface_key == b'\xff\xff\xff\xff'
+            or 224 <= interface_key[0] <= 239):
+        raise ValueError('interface_address must be a unicast IPv4 address')
+    _validate_options(
+        discovery_port, round_timeout, 0, socket.AF_INET)
+    return normalized_uuid, socket.inet_ntop(socket.AF_INET, interface_key), \
+        interface_key
+
+
+def _decode_multicast_response(datagram, token):
+    """Return one token-correlated, single-block NON response payload."""
+    try:
+        mtype, code, _mid, response_token, _options, _payload = \
+            parse_coap(datagram)
+    except MalformedMessageError:
+        return 'malformed', None
+    if response_token != token or code != _CONTENT or mtype != TYPE_NON:
+        return 'ignore', None
+
+    status, block, _ack_mid = _decode_response_block(
+        datagram,
+        token=token,
+        expected_number=0,
+        expected_szx=None,
+    )
+    if status != 'block':
+        return status, None
+    if (block.more or block.number != 0
+            or (block.size2 is not None
+                and block.size2 != len(block.payload))):
+        return 'malformed', None
+    return 'payload', block.payload
+
+
+def _multicast_result(
+        address, ports, rounds, responses, error_code=None):
+    return OcfMulticastSecurePortDiscoveryResult(
+        address=address,
+        ports=ports,
+        rounds=rounds,
+        responses=responses,
+        error_code=error_code,
+    )
+
+
+def discover_ocf_secure_ports_multicast(
+        target_uuid, *, interface_address, discovery_port=_DISCOVERY_PORT,
+        round_timeout=6.0):
+    """Find one exact OCF device identity on one IPv4 LAN interface.
+
+    This is an explicit entry point and never invokes the known-host unicast
+    discovery function.
+
+    Exactly two NON multicast discovery rounds are sent. A successful result
+    requires the same sole response source and the same non-empty secure-port
+    set in both rounds. Only the matching top-level ``di`` container is read;
+    legacy policy ports are bound to its response source, and ``eps`` hosts
+    must equal that source. No OCF security resource is read or written.
+    """
+    normalized_uuid, interface_address, interface_key = \
+        _validate_multicast_options(
+            target_uuid, interface_address, discovery_port, round_timeout)
+
+    selector = selectors.DefaultSelector()
+    sock = None
+    try:
+        sock = socket.socket(
+            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(
+            socket.IPPROTO_IP, socket.IP_MULTICAST_IF, interface_key)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+        sock.bind((interface_address, 0))
+        sock.setblocking(False)
+        selector.register(sock, selectors.EVENT_READ)
+    except (OSError, ValueError):
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        selector.close()
+        return _multicast_result(
+            None, (), 0, 0, 'interface_unavailable')
+
+    used_tokens = set()
+    used_mids = set()
+    round_matches = []
+    inconsistent_sources = set()
+    rounds = 0
+    responses = 0
+    target_seen = False
+    target_with_ports = False
+    valid_directory_response = False
+    saw_malformed = False
+
+    try:
+        for _round_number in range(_MULTICAST_ROUNDS):
+            token = secrets.token_bytes(8)
+            while token in used_tokens:
+                token = (
+                    (int.from_bytes(token, 'big') + 1) & ((1 << 64) - 1)
+                ).to_bytes(8, 'big')
+            used_tokens.add(token)
+            mid = secrets.randbits(16)
+            while mid in used_mids:
+                mid = (mid + 1) & 0xFFFF
+            used_mids.add(mid)
+            request = _build_request(token, mid, 0, None)
+            try:
+                sent_length = sock.sendto(
+                    request,
+                    (_IPV4_OCF_MULTICAST_GROUP, discovery_port),
+                )
+            except OSError:
+                break
+            if sent_length != len(request):
+                break
+            rounds += 1
+
+            matches = {}
+            deadline = time.monotonic() + float(round_timeout)
+            datagrams = 0
+            while datagrams < _MAX_MULTICAST_RESPONSES_PER_ROUND:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    events = selector.select(remaining)
+                except (OSError, ValueError):
+                    events = []
+                if not events:
+                    break
+                try:
+                    datagram, source = sock.recvfrom(
+                        _MAX_DATAGRAM_BYTES + 1)
+                except (BlockingIOError, OSError):
+                    continue
+                datagrams += 1
+                source_host_key = _host_key(socket.AF_INET, source)
+                if (_peer_key(socket.AF_INET, source) is None
+                        or source_host_key is None
+                        or source_host_key[0] == b'\x00\x00\x00\x00'
+                        or source_host_key[0] == b'\xff\xff\xff\xff'
+                        or 224 <= source_host_key[0][0] <= 239):
+                    continue
+                if len(datagram) > _MAX_DATAGRAM_BYTES:
+                    saw_malformed = True
+                    continue
+
+                status, payload = _decode_multicast_response(
+                    datagram, token)
+                if status == 'ignore':
+                    continue
+                if status != 'payload':
+                    saw_malformed = True
+                    continue
+                responses += 1
+                target_status, ports = _target_secure_ports_from_payload(
+                    payload, normalized_uuid, source_host_key[0])
+                if target_status == 'malformed':
+                    saw_malformed = True
+                    continue
+                valid_directory_response = True
+                if target_status == 'absent':
+                    continue
+
+                target_seen = True
+                target_with_ports = target_with_ports or bool(ports)
+                source_key = source_host_key[0]
+                address = socket.inet_ntop(socket.AF_INET, source_key)
+                previous = matches.get(source_key)
+                candidate = (address, ports)
+                if previous is not None and previous != candidate:
+                    inconsistent_sources.add(source_key)
+                    continue
+                matches[source_key] = candidate
+            round_matches.append(matches)
+
+        if rounds != _MULTICAST_ROUNDS:
+            return _multicast_result(
+                None, (), rounds, responses, 'interface_unavailable')
+
+        sources = set().union(*(set(matches) for matches in round_matches))
+        if inconsistent_sources or len(sources) > 1:
+            return _multicast_result(
+                None, (), rounds, responses, 'ambiguous_target')
+        if len(sources) == 1 and all(len(matches) == 1
+                                     for matches in round_matches):
+            source_key = next(iter(sources))
+            first = round_matches[0][source_key]
+            second = round_matches[1][source_key]
+            if first == second and first[1]:
+                return _multicast_result(
+                    first[0], first[1], rounds, responses)
+
+        if not target_seen:
+            if not responses:
+                error_code = 'no_ocf_response'
+            elif valid_directory_response:
+                error_code = 'target_not_found'
+            elif saw_malformed:
+                error_code = 'malformed_ocf_response'
+            else:
+                error_code = 'target_not_found'
+        elif not target_with_ports:
+            error_code = 'no_secure_ports'
+        else:
+            error_code = 'target_not_stable'
+        return _multicast_result(
+            None, (), rounds, responses, error_code)
+    finally:
+        try:
+            selector.unregister(sock)
+        except (KeyError, OSError, ValueError):
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+        selector.close()
+
+
 def _result(ports, attempts, response_received, error_code=None):
     return OcfSecurePortDiscoveryResult(
         ports=ports,
@@ -406,6 +790,9 @@ def discover_ocf_secure_ports(
         host, *, discovery_port=_DISCOVERY_PORT, timeout=3.0, retries=1,
         family=socket.AF_UNSPEC):
     """Discover secure ports advertised by a target's public OCF directory.
+
+    This is an explicit known-host entry point and never starts multicast as
+    an automatic fallback.
 
     Name resolution happens synchronously first. ``timeout`` then bounds all
     socket I/O, including a token-stable Block2 transfer. A port advertisement

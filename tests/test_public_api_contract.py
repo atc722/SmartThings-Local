@@ -13,8 +13,10 @@ from smartthings_local.protocol.auth import (
 )
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 from smartthings_local.protocol.ocf_discovery import (
+    OcfMulticastSecurePortDiscoveryResult,
     OcfSecurePortDiscoveryResult,
     discover_ocf_secure_ports,
+    discover_ocf_secure_ports_multicast,
 )
 
 
@@ -149,4 +151,28 @@ def test_ocf_secure_port_discovery_has_a_small_composable_surface():
     )
 
     assert result.found
+    assert result.ports == (5684,)
+
+
+def test_identity_aware_multicast_discovery_is_explicitly_ipv4_scoped():
+    _assert_compatible_signature(
+        discover_ocf_secure_ports_multicast,
+        ['target_uuid', 'interface_address'],
+    )
+    interface_parameter = inspect.signature(
+        discover_ocf_secure_ports_multicast).parameters['interface_address']
+    assert interface_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert interface_parameter.default is inspect.Parameter.empty
+    assert inspect.signature(
+        discover_ocf_secure_ports_multicast
+    ).parameters['round_timeout'].default == 6.0
+
+    result = OcfMulticastSecurePortDiscoveryResult(
+        address='192.0.2.20',
+        ports=(5684,),
+        rounds=2,
+        responses=2,
+    )
+    assert result.found
+    assert result.address == '192.0.2.20'
     assert result.ports == (5684,)

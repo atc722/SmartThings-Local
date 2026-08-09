@@ -3,7 +3,9 @@
 import socket
 import threading
 import traceback
+import uuid
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import cbor2
 import pytest
@@ -42,6 +44,64 @@ def _payload(*links, padding=''):
     if padding:
         value['padding'] = padding
     return cbor2.dumps(value)
+
+
+def _identity_payload(device_id, *links):
+    return cbor2.dumps({'di': device_id, 'links': list(links)})
+
+
+class _FakeMulticastSocket:
+    def __init__(self, response_factory):
+        self.response_factory = response_factory
+        self.responses = []
+        self.requests = []
+        self.socket_options = []
+        self.bound = None
+        self.recv_count = 0
+        self.closed = False
+
+    def setsockopt(self, level, option, value):
+        self.socket_options.append((level, option, value))
+
+    def bind(self, address):
+        self.bound = address
+
+    def setblocking(self, _blocking):
+        pass
+
+    def sendto(self, request, destination):
+        self.requests.append((request, destination))
+        self.responses.extend(
+            self.response_factory(request, len(self.requests)))
+        return len(request)
+
+    def recvfrom(self, _size):
+        if not self.responses:
+            raise BlockingIOError
+        self.recv_count += 1
+        return self.responses.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeSelector:
+    def __init__(self):
+        self.sock = None
+
+    def register(self, sock, _events):
+        self.sock = sock
+
+    def unregister(self, sock):
+        assert sock is self.sock
+
+    def select(self, _timeout):
+        if self.sock.responses:
+            return [(SimpleNamespace(data=None), 1)]
+        return []
+
+    def close(self):
+        pass
 
 
 def _option_map(options):
@@ -117,6 +177,77 @@ def test_valid_directory_without_secure_doxm_has_no_ports():
     value = {'links': [{'href': '/oic/d', 'rt': ['oic.wk.d']}]}
 
     assert discovery._secure_ports_from_payload(cbor2.dumps(value)) == ()
+
+
+def test_multicast_extraction_is_identity_and_response_source_scoped():
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    other = uuid.UUID('00000000-0000-0000-0000-000000000000')
+    source = socket.inet_pton(socket.AF_INET, '192.0.2.20')
+    payload = cbor2.dumps([
+        {
+            'di': str(other),
+            'links': [_doxm_link(49901)],
+        },
+        {
+            'di': target.bytes,
+            'links': [
+                _doxm_link(49872),
+                {
+                    'href': '/oic/sec/doxm',
+                    'rt': 'oic.r.doxm',
+                    'eps': [
+                        {'ep': 'coaps://192.0.2.20:49873'},
+                        {'ep': 'coaps://192.0.2.21:49874'},
+                        {'ep': 'coap://192.0.2.20:49875'},
+                    ],
+                },
+            ],
+        },
+    ])
+
+    status, ports = discovery._target_secure_ports_from_payload(
+        payload, target, source)
+
+    assert status == 'target'
+    assert ports == (49872, 49873)
+
+
+def test_multicast_target_uuid_is_normalized_but_never_fuzzy_matched():
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    source = socket.inet_pton(socket.AF_INET, '192.0.2.20')
+
+    assert discovery._normalize_uuid(
+        f'URN:UUID:{str(target).upper()}') == target
+    assert discovery._normalize_uuid(target.bytes) == target
+    assert discovery._target_secure_ports_from_payload(
+        _identity_payload(str(target) + '0', _doxm_link()),
+        target,
+        source,
+    ) == ('absent', ())
+
+
+def test_multicast_duplicate_target_containers_fail_closed():
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    source = socket.inet_pton(socket.AF_INET, '192.0.2.20')
+    payload = cbor2.dumps([
+        {'di': str(target), 'links': [_doxm_link(49872)]},
+        {'di': str(target), 'links': [_doxm_link(49873)]},
+    ])
+
+    assert discovery._target_secure_ports_from_payload(
+        payload, target, source) == ('malformed', ())
+
+
+def test_multicast_never_treats_the_identity_container_as_a_link():
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    source = socket.inet_pton(socket.AF_INET, '192.0.2.20')
+    payload = cbor2.dumps({
+        'di': str(target),
+        **_doxm_link(49872),
+    })
+
+    assert discovery._target_secure_ports_from_payload(
+        payload, target, source) == ('malformed', ())
 
 
 def test_response_type_and_token_matrix():
@@ -418,6 +549,255 @@ def test_retry_keeps_token_and_changes_message_id():
     assert result.attempts == 2
 
 
+def test_ipv4_multicast_discovery_requires_two_stable_identity_rounds(
+        monkeypatch):
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    other = uuid.UUID('00000000-0000-0000-0000-000000000000')
+    target_source = ('192.0.2.20', 41000)
+    other_source = ('192.0.2.21', 42000)
+
+    def response_factory(request, round_number):
+        mtype, code, mid, token, options, payload = parse_coap(request)
+        option_map = _option_map(options)
+        assert (mtype, code) == (TYPE_NON, METHOD_GET)
+        assert payload == b''
+        assert option_map[URI_PATH] == [b'oic', b'res']
+        assert option_map[URI_QUERY] == [b'rt=oic.r.doxm']
+        assert option_map[ACCEPT] == [CF_CBOR]
+        target_payload = _identity_payload(
+            str(target),
+            _doxm_link(49872),
+            {
+                'href': '/oic/sec/doxm',
+                'rt': ['oic.r.doxm'],
+                'eps': [
+                    {'ep': 'coaps://192.0.2.20:49873'},
+                    {'ep': 'coaps://192.0.2.21:49874'},
+                ],
+            },
+        )
+        unrelated_payload = _identity_payload(
+            str(other), _doxm_link(49901))
+        return [
+            (
+                build_coap(
+                    TYPE_NON, 0x45, mid + 1, b'badtoken', [],
+                    target_payload),
+                target_source,
+            ),
+            (
+                build_coap(
+                    TYPE_CON, 0x45, mid + 2, token, [], target_payload),
+                target_source,
+            ),
+            (
+                build_coap(
+                    TYPE_NON, 0x45, mid + 3, token, [],
+                    unrelated_payload),
+                other_source,
+            ),
+            (
+                build_coap(
+                    TYPE_NON, 0x45, mid + 4, token, [], target_payload),
+                target_source,
+            ),
+        ]
+
+    fake_socket = _FakeMulticastSocket(response_factory)
+    socket_calls = []
+
+    def open_socket(*args):
+        socket_calls.append(args)
+        return fake_socket
+
+    def unexpected_unicast(*_args, **_kwargs):
+        pytest.fail('explicit multicast discovery invoked unicast fallback')
+
+    monkeypatch.setattr(discovery.socket, 'socket', open_socket)
+    monkeypatch.setattr(
+        discovery, 'discover_ocf_secure_ports', unexpected_unicast)
+    monkeypatch.setattr(
+        discovery.selectors, 'DefaultSelector', _FakeSelector)
+
+    result = discovery.discover_ocf_secure_ports_multicast(
+        f'urn:uuid:{target}',
+        interface_address='192.0.2.10',
+        round_timeout=0.1,
+    )
+
+    assert result.address == target_source[0]
+    assert result.ports == (49872, 49873)
+    assert result.rounds == 2
+    assert result.responses == 4
+    assert result.error_code is None
+    assert result.found
+    assert len(socket_calls) == 1
+    assert len(fake_socket.requests) == 2
+    assert fake_socket.requests[0][1] == (
+        discovery._IPV4_OCF_MULTICAST_GROUP, 5683)
+    first = parse_coap(fake_socket.requests[0][0])
+    second = parse_coap(fake_socket.requests[1][0])
+    assert first[2] != second[2]
+    assert first[3] != second[3]
+    assert fake_socket.bound == ('192.0.2.10', 0)
+    assert (
+        socket.IPPROTO_IP,
+        socket.IP_MULTICAST_IF,
+        socket.inet_pton(socket.AF_INET, '192.0.2.10'),
+    ) in fake_socket.socket_options
+    assert (
+        socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1,
+    ) in fake_socket.socket_options
+    assert (
+        socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0,
+    ) in fake_socket.socket_options
+    assert fake_socket.closed
+    rendered = repr(result)
+    assert target_source[0] not in rendered
+    assert str(target) not in rendered
+    assert '49872' not in rendered
+
+
+def test_ipv4_multicast_discovery_rejects_changing_target_source(
+        monkeypatch):
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    sources = [('192.0.2.20', 41000), ('192.0.2.21', 42000)]
+
+    def response_factory(request, round_number):
+        _mtype, _code, mid, token, _options, _payload = parse_coap(request)
+        payload = _identity_payload(str(target), _doxm_link(49872))
+        return [(
+            build_coap(TYPE_NON, 0x45, mid + 1, token, [], payload),
+            sources[round_number - 1],
+        )]
+
+    fake_socket = _FakeMulticastSocket(response_factory)
+    monkeypatch.setattr(
+        discovery.socket, 'socket', lambda *_args: fake_socket)
+    monkeypatch.setattr(
+        discovery.selectors, 'DefaultSelector', _FakeSelector)
+
+    result = discovery.discover_ocf_secure_ports_multicast(
+        target,
+        interface_address='192.0.2.10',
+        round_timeout=0.1,
+    )
+
+    assert not result.found
+    assert result.address is None
+    assert result.ports == ()
+    assert result.error_code == 'ambiguous_target'
+
+
+def test_ipv4_multicast_no_response_stops_without_unicast_fallback(
+        monkeypatch):
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    fake_socket = _FakeMulticastSocket(
+        lambda _request, _round_number: [])
+
+    def unexpected_unicast(*_args, **_kwargs):
+        pytest.fail('explicit multicast discovery invoked unicast fallback')
+
+    monkeypatch.setattr(
+        discovery.socket, 'socket', lambda *_args: fake_socket)
+    monkeypatch.setattr(
+        discovery.selectors, 'DefaultSelector', _FakeSelector)
+    monkeypatch.setattr(
+        discovery, 'discover_ocf_secure_ports', unexpected_unicast)
+
+    result = discovery.discover_ocf_secure_ports_multicast(
+        target,
+        interface_address='192.0.2.10',
+        round_timeout=0.1,
+    )
+
+    assert not result.found
+    assert result.rounds == 2
+    assert result.responses == 0
+    assert result.error_code == 'no_ocf_response'
+    assert len(fake_socket.requests) == 2
+
+
+def test_ipv4_multicast_rounds_are_time_and_datagram_bounded(monkeypatch):
+    target = uuid.UUID('11111111-2222-3333-4444-555555555555')
+    source = ('192.0.2.20', 41000)
+
+    def response_factory(request, _round_number):
+        _mtype, _code, mid, _token, _options, _payload = parse_coap(request)
+        return [
+            (
+                build_coap(
+                    TYPE_NON,
+                    0x45,
+                    (mid + offset + 1) & 0xFFFF,
+                    b'wrong-token',
+                    [],
+                    _identity_payload(str(target), _doxm_link()),
+                ),
+                source,
+            )
+            for offset in range(
+                discovery._MAX_MULTICAST_RESPONSES_PER_ROUND + 1)
+        ]
+
+    class RecordingSelector(_FakeSelector):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        def select(self, timeout):
+            self.timeouts.append(timeout)
+            return super().select(timeout)
+
+    fake_socket = _FakeMulticastSocket(response_factory)
+    fake_selector = RecordingSelector()
+    monkeypatch.setattr(
+        discovery.socket, 'socket', lambda *_args: fake_socket)
+    monkeypatch.setattr(
+        discovery.selectors, 'DefaultSelector', lambda: fake_selector)
+
+    round_timeout = 0.1
+    result = discovery.discover_ocf_secure_ports_multicast(
+        target,
+        interface_address='192.0.2.10',
+        round_timeout=round_timeout,
+    )
+
+    assert not result.found
+    assert result.rounds == 2
+    assert len(fake_socket.requests) == 2
+    assert fake_socket.recv_count == (
+        discovery._MAX_MULTICAST_RESPONSES_PER_ROUND * 2)
+    assert len(fake_selector.timeouts) == fake_socket.recv_count
+    assert all(
+        0 < timeout <= round_timeout for timeout in fake_selector.timeouts)
+
+
+@pytest.mark.parametrize(
+    ('target_uuid', 'interface_address', 'round_timeout', 'error_type'),
+    (
+        ('not-a-uuid', '192.0.2.10', 1.0, ValueError),
+        (object(), '192.0.2.10', 1.0, TypeError),
+        ('11111111-2222-3333-4444-555555555555', 'not-an-ip', 1.0,
+         ValueError),
+        ('11111111-2222-3333-4444-555555555555', 1, 1.0, TypeError),
+        ('11111111-2222-3333-4444-555555555555',
+         discovery._IPV4_OCF_MULTICAST_GROUP, 1.0,
+         ValueError),
+        ('11111111-2222-3333-4444-555555555555', '192.0.2.10', 30.1,
+         ValueError),
+    ),
+)
+def test_invalid_multicast_options_fail_before_network(
+        target_uuid, interface_address, round_timeout, error_type):
+    with pytest.raises(error_type):
+        discovery.discover_ocf_secure_ports_multicast(
+            target_uuid,
+            interface_address=interface_address,
+            round_timeout=round_timeout,
+        )
+
+
 def test_resolution_failure_and_result_repr_are_redacted(monkeypatch):
     remote_host = 'private-appliance.invalid'
 
@@ -427,7 +807,15 @@ def test_resolution_failure_and_result_repr_are_redacted(monkeypatch):
         assert family == socket.AF_INET6
         raise EndpointError()
 
+    def unexpected_multicast(*_args, **_kwargs):
+        pytest.fail('known-host discovery invoked multicast fallback')
+
     monkeypatch.setattr(discovery, 'resolve_udp_endpoints', fail)
+    monkeypatch.setattr(
+        discovery,
+        'discover_ocf_secure_ports_multicast',
+        unexpected_multicast,
+    )
 
     result = discovery.discover_ocf_secure_ports(
         remote_host, family=socket.AF_INET6)
